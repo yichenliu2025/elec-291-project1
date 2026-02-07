@@ -648,6 +648,22 @@ got_delta:
     lcall Display_SignedTemp1dp_LCD
 
     ;====================================================
+    ; Immediate cutoff: stop heating as soon as Thot10 >= 700
+    ;====================================================
+    mov x+0, thot10+0
+    mov x+1, thot10+1
+    mov x+2, thot10+2
+    mov x+3, thot10+3
+    Load_y(700)
+    lcall sub32                ; x = Thot10 - 700
+    mov a, x+3
+    jb  ACC.7, keep_heating_now
+    lcall SSR_Off
+    mov state, #2              ; DONE
+    ljmp loop_again
+
+keep_heating_now:
+    ;====================================================
     ; Timebase: 200ms tick; run FSM once per 1 second
     ;====================================================
     lcall Delay200ms
