@@ -1,247 +1,585 @@
 $MODMAX10
 
-;===========================================================
-; SFR / MMIO definitions (UNCOMMENT / ADJUST IF NEEDED)
-;===========================================================
-ADC_C   DATA 0A1h
-ADC_L   DATA 0A2h
-ADC_H   DATA 0A3h
+;========================================================
+; Reflow Oven Controller (Stage 1 Bring-up)
+; DE10-Lite: SSR control on IO15 = P4.6
+;
+; ADC0 = LM335 cold junction temperature
+; ADC1 = LM4040 reference
+; ADC2 = OP07 thermocouple amplifier output (Vout)
+;
+; OFFSET CALIBRATION on ADC2 at startup:
+;   Voff_mV = average(Vout_mV) during first ~300ms
+;
+; Then each loop:
+;   Vdiff_mV = Vout_mV - Voff_mV   (can be negative)
+;   deltaT10 = round( Vdiff_mV * 100 / 123 )   (0.1째C)
+;   Thot10   = Tcold10 + deltaT10
+;
+; Display Thot on HEX4..HEX0 as XXXX.X (dp at HEX1)
+; Sign (if negative) shown on HEX5 ('-' or blank).
+;
+; FSM (simple test):
+;   state 0 IDLE   -> SSR OFF
+;   state 1 HEAT60 -> SSR ON until Thot10 >= 600 (60.0째C)
+;   state 2 DONE   -> SSR OFF
+;   state 3 ABORT  -> SSR OFF
+;
+; Safety (in HEAT60):
+;   if after 60 seconds Thot10 < 500 (50.0째C) -> ABORT
+;
+; NOTE: For your BJT driver (2N3904, 1k base resistor, SSR+ to +5V):
+;       P4.6 HIGH => transistor ON => SSR ON
+;       P4.6 LOW  => transistor OFF => SSR OFF
+;========================================================
 
-; If your project already defines HEX0..HEX5 elsewhere,
-; delete these 6 lines to avoid redefinition errors.
-HEX0    DATA 090h
-HEX1    DATA 091h
-HEX2    DATA 092h
-HEX3    DATA 093h
-HEX4    DATA 094h
-HEX5    DATA 095h
+    CSEG at 0
+    ljmp mycode
 
-            CSEG    AT 0000h
-            LJMP    mycode
+;----------------------------
+; SSR Output (DE10-Lite IO15)
+;----------------------------
+SSR_OUT     equ P4.6
 
-;===========================================================
-; Data segments
-;===========================================================
-DSEG    AT 30h
-x:          DS 4
-y:          DS 4
-bcd:        DS 5
-adc0_32:     DS 4
-adc1_32:     DS 4
+;----------------------------
+; RAM
+;----------------------------
+dseg at 30h
+x:           ds 4
+y:           ds 4
+bcd:         ds 5
+adc0_32:     ds 4
+adc1_32:     ds 4
+adc2_32:     ds 4
 
-BSEG
-mf:         DBIT 1
+tcold10:     ds 4        ; 0.1째C
+voff_mV:     ds 4        ; mV
+vout_mV:     ds 4        ; mV
+vdiff_mV:    ds 4        ; mV (signed)
+deltat10:    ds 4        ; 0.1째C (signed)
+thot10:      ds 4        ; 0.1째C (signed) copy of computed Thot10
+
+; FSM vars
+state:       ds 1        ; 0=IDLE, 1=HEAT_TO_60, 2=DONE, 3=ABORT
+tick200:     ds 1        ; 0..4  (5*200ms = 1s)
+sec_in_heat: ds 2        ; seconds in HEAT_TO_60
+
+bseg
+mf:          dbit 1
 
 $include(math32.asm)
 
-;===========================================================
-; Code
-;===========================================================
-CSEG
+cseg
 
+;========================================================
+; 7-seg LUT
+;========================================================
 myLUT:
-    DB 0C0h, 0F9h, 0A4h, 0B0h, 099h
-    DB 092h, 082h, 0F8h, 080h, 090h
-    DB 088h, 083h, 0C6h, 0A1h, 086h, 08Eh
+    DB 0xC0, 0xF9, 0xA4, 0xB0, 0x99
+    DB 0x92, 0x82, 0xF8, 0x80, 0x90
+    DB 0x88, 0x83, 0xC6, 0xA1, 0x86, 0x8E
 
-;-----------------------------------------
-; Small delay (safe short delay)
-;-----------------------------------------
+;========================================================
+; Delays
+;========================================================
 DelaySmall:
-    NOP
-    NOP
-    NOP
-    RET
+    nop
+    nop
+    nop
+    ret
 
-;-----------------------------------------
-; ~50ms delay (tuned by loops)
-;-----------------------------------------
 Delay50ms:
-    MOV R0, #30
+    mov R0, #30
 D50_L0:
-    MOV R1, #74
+    mov R1, #74
 D50_L1:
-    MOV R2, #250
+    mov R2, #250
 D50_L2:
-    DJNZ R2, D50_L2
-    DJNZ R1, D50_L1
-    DJNZ R0, D50_L0
-    RET
+    djnz R2, D50_L2
+    djnz R1, D50_L1
+    djnz R0, D50_L0
+    ret
 
-;-----------------------------------------
-; ~200ms delay
-;-----------------------------------------
 Delay200ms:
-    LCALL Delay50ms
-    LCALL Delay50ms
-    LCALL Delay50ms
-    LCALL Delay50ms
-    RET
+    lcall Delay50ms
+    lcall Delay50ms
+    lcall Delay50ms
+    lcall Delay50ms
+    ret
 
-;-----------------------------------------
-; Display XXXX with 1 decimal: XXX.X
-; Decimal point ON at HEX1 (active-low DP assumed)
-; Uses bcd[1:0] after hex2bcd:
-;   bcd+1: thousands/hundreds
-;   bcd+0: tens/ones
-;-----------------------------------------
-Display_Temp1dp_HEX3to0:
-    MOV DPTR, #myLUT
+;========================================================
+; SSR control helpers
+;========================================================
+SSR_On:
+    setb SSR_OUT
+    ret
+
+SSR_Off:
+    clr  SSR_OUT
+    ret
+
+;========================================================
+; Display signed XXXX.X on HEX4..HEX0, sign on HEX5
+; Input: x = value*10 (0.1째C), signed 32-bit
+;========================================================
+Display_SignedTemp1dp:
+    ; sign check
+    mov a, x+3
+    jb  ACC.7, ds_neg
+
+ds_pos:
+    mov HEX5, #0FFh        ; blank
+    ljmp ds_abs
+
+ds_neg:
+    mov HEX5, #0BFh        ; '-'
+    ; x = abs(x) (two's complement)
+    mov a, x+0
+    cpl a
+    mov x+0, a
+    mov a, x+1
+    cpl a
+    mov x+1, a
+    mov a, x+2
+    cpl a
+    mov x+2, a
+    mov a, x+3
+    cpl a
+    mov x+3, a
+    Load_y(1)
+    lcall add32
+
+ds_abs:
+    ; now x is positive magnitude
+    lcall hex2bcd
+    mov dptr, #myLUT
+
+    ; Ten-thousands -> HEX4  (bcd+2 low nibble)
+    mov a, bcd+2
+    anl a, #0FH
+    movc a, @a+dptr
+    mov HEX4, a
 
     ; Thousands -> HEX3
-    MOV A, bcd+1
-    SWAP A
-    ANL  A, #0Fh
-    MOVC A, @A+DPTR
-    MOV  HEX3, A
+    mov a, bcd+1
+    swap a
+    anl a, #0FH
+    movc a, @a+dptr
+    mov HEX3, a
 
     ; Hundreds -> HEX2
-    MOV A, bcd+1
-    ANL  A, #0Fh
-    MOVC A, @A+DPTR
-    MOV  HEX2, A
+    mov a, bcd+1
+    anl a, #0FH
+    movc a, @a+dptr
+    mov HEX2, a
 
     ; Tens -> HEX1 (dp ON)
-    MOV A, bcd+0
-    SWAP A
-    ANL  A, #0Fh
-    MOVC A, @A+DPTR
-    ANL  A, #07Fh        ; DP on (bit7=0)
-    MOV  HEX1, A
+    mov a, bcd+0
+    swap a
+    anl a, #0FH
+    movc a, @a+dptr
+    anl a, #07Fh
+    mov HEX1, a
 
-    ; Ones -> HEX0  (this is the 0.1캜 digit after scaling)
-    MOV A, bcd+0
-    ANL  A, #0Fh
-    MOVC A, @A+DPTR
-    MOV  HEX0, A
+    ; Ones -> HEX0
+    mov a, bcd+0
+    anl a, #0FH
+    movc a, @a+dptr
+    mov HEX0, a
+    ret
 
-    ; Unused HEX -> blank/0
-    MOV HEX4, #0C0h
-    MOV HEX5, #0C0h
-    RET
+ShowErr:
+    ; show 9999.9
+    Load_x(99999)
+    lcall Display_SignedTemp1dp
+    ret
 
-ShowErr9999:
-    Load_x(9999)
-    LCALL hex2bcd
-    LCALL Display_Temp1dp_HEX3to0
-    RET
-
-Show0000:
-    Load_x(0)
-    LCALL hex2bcd
-    LCALL Display_Temp1dp_HEX3to0
-    RET
-
-;-----------------------------------------
-; Read ADC channel into adc?_32
-; Adds settle/update delay
-;-----------------------------------------
+;========================================================
+; Read ADC channels
+;========================================================
 ReadADC0:
-    MOV ADC_C, #00h
-    LCALL DelaySmall
-    LCALL Delay50ms
-
-    MOV adc0_32+3, #00h
-    MOV adc0_32+2, #00h
-    MOV adc0_32+1, ADC_H
-    MOV adc0_32+0, ADC_L
-    RET
+    mov ADC_C, #00h
+    lcall DelaySmall
+    lcall Delay50ms
+    mov adc0_32+3, #0
+    mov adc0_32+2, #0
+    mov adc0_32+1, ADC_H
+    mov adc0_32+0, ADC_L
+    ret
 
 ReadADC1:
-    MOV ADC_C, #01h
-    LCALL DelaySmall
-    LCALL Delay50ms
+    mov ADC_C, #01h
+    lcall DelaySmall
+    lcall Delay50ms
+    mov adc1_32+3, #0
+    mov adc1_32+2, #0
+    mov adc1_32+1, ADC_H
+    mov adc1_32+0, ADC_L
+    ret
 
-    MOV adc1_32+3, #00h
-    MOV adc1_32+2, #00h
-    MOV adc1_32+1, ADC_H
-    MOV adc1_32+0, ADC_L
-    RET
+ReadADC2:
+    mov ADC_C, #02h
+    lcall DelaySmall
+    lcall Delay50ms
+    mov adc2_32+3, #0
+    mov adc2_32+2, #0
+    mov adc2_32+1, ADC_H
+    mov adc2_32+0, ADC_L
+    ret
 
-;===========================================================
-; Main
-;===========================================================
-mycode:
-    MOV SP, #7Fh
-
-    ; Reset ADC block
-    MOV ADC_C, #80h
-    LCALL Delay50ms
-
-main_loop:
-    ;---------------------------
-    ; Read reference ADC1
-    ;---------------------------
-    LCALL ReadADC1
-
-    ; Guard: if ADC1 < 50 -> error (avoid division explosion)
-    MOV A, adc1_32+1
-    JNZ ref_ok
-    MOV A, adc1_32+0
-    CLR C
-    SUBB A, #50
-    JC  ref_bad
-ref_ok:
-
-    ;---------------------------
-    ; Read sensor ADC0
-    ;---------------------------
-    LCALL ReadADC0
-
-    ; x = ADC0 (16-bit placed into 32-bit x)
-    MOV x+3, #00h
-    MOV x+2, #00h
-    MOV x+1, adc0_32+1
-    MOV x+0, adc0_32+0
-
-    ; x = x * 4096
+;========================================================
+; Convert ADC2 to mV using ADC1 reference
+; return: x = mV (unsigned)
+;========================================================
+ADC2_to_mV:
+    ; x = ADC2
+    mov x+3, #0
+    mov x+2, #0
+    mov x+1, adc2_32+1
+    mov x+0, adc2_32+0
     Load_y(4096)
-    LCALL mul32
+    lcall mul32
 
     ; y = ADC1
-    MOV y+3, #00h
-    MOV y+2, #00h
-    MOV y+1, adc1_32+1
-    MOV y+0, adc1_32+0
+    mov y+3, #0
+    mov y+2, #0
+    mov y+1, adc1_32+1
+    mov y+0, adc1_32+0
+    lcall div32
+    ret
 
-    ; x = (ADC0*4096)/ADC1  -> mV (scaled by your divider choice)
-    LCALL div32
+;========================================================
+; FSM Update (called once per second)
+; Uses thot10 (signed 0.1째C)
+;========================================================
+FSM_1s_Update:
+    mov a, state
+    cjne a, #1, fsm_not_heat   ; only act in HEAT_TO_60
 
-    ; x = mV * 10
+    ; sec_in_heat++
+    inc sec_in_heat+0
+    mov a, sec_in_heat+0
+    jnz heat_sec_ok
+    inc sec_in_heat+1
+heat_sec_ok:
+
+    ;-----------------------------------------
+    ; If Thot10 >= 600 => DONE (SSR OFF)
+    ;-----------------------------------------
+    mov x+0, thot10+0
+    mov x+1, thot10+1
+    mov x+2, thot10+2
+    mov x+3, thot10+3
+    Load_y(600)
+    lcall sub32                ; x = Thot10 - 600
+    mov a, x+3
+    jnb ACC.7, reached60       ; not negative => >= 600
+
+    ;-----------------------------------------
+    ; Safety: if sec_in_heat >= 60 AND Thot10 < 500 => ABORT
+    ;-----------------------------------------
+    mov a, sec_in_heat+1
+    jnz sec_ge_60
+    mov a, sec_in_heat+0
+    clr c
+    subb a, #60
+    jc  keep_heating           ; <60 seconds -> keep heating
+
+sec_ge_60:
+    mov x+0, thot10+0
+    mov x+1, thot10+1
+    mov x+2, thot10+2
+    mov x+3, thot10+3
+    Load_y(500)
+    lcall sub32                ; x = Thot10 - 500
+    mov a, x+3
+    jb  ACC.7, do_abort        ; negative => Thot10 < 500
+
+keep_heating:
+    lcall SSR_On
+    ret
+
+reached60:
+    lcall SSR_Off
+    mov state, #2              ; DONE
+    ret
+
+do_abort:
+    lcall SSR_Off
+    mov state, #3              ; ABORT
+    ret
+
+fsm_not_heat:
+    ; IDLE / DONE / ABORT -> SSR OFF
+    lcall SSR_Off
+    ret
+
+;========================================================
+; Main
+;========================================================
+mycode:
+    mov SP, #7FH
+
+    ; SSR output default OFF
+    lcall SSR_Off
+
+    ; FSM init: start heating immediately
+    mov state, #1              ; HEAT_TO_60
+    mov tick200, #0
+    mov sec_in_heat+0, #0
+    mov sec_in_heat+1, #0
+    lcall SSR_On               ; <--- IMPORTANT: start SSR immediately (no 1s wait)
+
+    ; reset ADC
+    mov ADC_C, #80h
+    lcall Delay50ms
+
+    ; read reference
+    lcall ReadADC1
+
+    ; guard ADC1 >= 50
+    mov a, adc1_32+1
+    jnz adc1_ok
+    mov a, adc1_32+0
+    clr c
+    subb a, #50
+    jnc adc1_ok
+    ljmp ref_bad
+
+adc1_ok:
+    ;====================================================
+    ; Offset calibration: average 6 samples (~300ms)
+    ;====================================================
+    Load_x(0)
+    mov voff_mV+0, x+0
+    mov voff_mV+1, x+1
+    mov voff_mV+2, x+2
+    mov voff_mV+3, x+3
+
+    mov R7, #6
+cal_loop:
+    lcall ReadADC2
+    lcall ADC2_to_mV          ; x = mV
+
+    ; sum = sum + x
+    mov y+0, voff_mV+0
+    mov y+1, voff_mV+1
+    mov y+2, voff_mV+2
+    mov y+3, voff_mV+3
+    lcall add32               ; x = x + y
+    mov voff_mV+0, x+0
+    mov voff_mV+1, x+1
+    mov voff_mV+2, x+2
+    mov voff_mV+3, x+3
+    djnz R7, cal_loop
+
+    ; voff = (sum + 3) / 6  (round)
+    mov x+0, voff_mV+0
+    mov x+1, voff_mV+1
+    mov x+2, voff_mV+2
+    mov x+3, voff_mV+3
+    Load_y(3)
+    lcall add32
+    Load_y(6)
+    lcall div32
+    mov voff_mV+0, x+0
+    mov voff_mV+1, x+1
+    mov voff_mV+2, x+2
+    mov voff_mV+3, x+3
+
+main_loop:
+    ;====================================================
+    ; Cold temp (LM335) -> tcold10
+    ;====================================================
+    lcall ReadADC0
+
+    ; x = ADC0
+    mov x+3, #0
+    mov x+2, #0
+    mov x+1, adc0_32+1
+    mov x+0, adc0_32+0
+    Load_y(4096)
+    lcall mul32
+
+    ; y = ADC1
+    mov y+3, #0
+    mov y+2, #0
+    mov y+1, adc1_32+1
+    mov y+0, adc1_32+0
+    lcall div32               ; x = mV
+
     Load_y(10)
-    LCALL mul32
-
-    ; x = C*100 = (mV*10) - 27315
+    lcall mul32               ; x = mV*10  (K*100)
     Load_y(27315)
-    LCALL sub32
+    lcall sub32               ; x = C*100
 
-    ; If negative -> show 0000
-    MOV A, x+3
-    JB  ACC.7, temp_negative
+    ; if negative -> clamp to 0
+    mov a, x+3
+    jnb ACC.7, cold_pos
+    Load_x(0)
+    ljmp cold_store
 
-    ; rounding to 0.1캜:
-    ; (C*100 + 5)/10 => C*10
+cold_pos:
     Load_y(5)
-    LCALL add32
-
+    lcall add32
     Load_y(10)
-    LCALL div32          ; x = C*10
+    lcall div32               ; x = tcold10
 
-    ; Display XXX.X
-    LCALL hex2bcd
-    LCALL Display_Temp1dp_HEX3to0
+cold_store:
+    mov tcold10+0, x+0
+    mov tcold10+1, x+1
+    mov tcold10+2, x+2
+    mov tcold10+3, x+3
 
-    LCALL Delay200ms
-    LJMP main_loop
+    ;====================================================
+    ; Vdiff = Vout - Voff (mV, signed)
+    ;====================================================
+    lcall ReadADC2
+    lcall ADC2_to_mV          ; x = Vout_mV
+    mov vout_mV+0, x+0
+    mov vout_mV+1, x+1
+    mov vout_mV+2, x+2
+    mov vout_mV+3, x+3
+
+    ; x = Vout
+    mov x+0, vout_mV+0
+    mov x+1, vout_mV+1
+    mov x+2, vout_mV+2
+    mov x+3, vout_mV+3
+    ; y = Voff
+    mov y+0, voff_mV+0
+    mov y+1, voff_mV+1
+    mov y+2, voff_mV+2
+    mov y+3, voff_mV+3
+    lcall sub32               ; x = Vdiff_mV (signed)
+    mov vdiff_mV+0, x+0
+    mov vdiff_mV+1, x+1
+    mov vdiff_mV+2, x+2
+    mov vdiff_mV+3, x+3
+
+    ;====================================================
+    ; deltaT10 = round( Vdiff_mV * 100 / 123 )
+    ; signed support: handle sign manually
+    ;====================================================
+    mov a, vdiff_mV+3
+    jb  ACC.7, vdiff_neg
+
+vdiff_pos:
+    ; x = Vdiff
+    mov x+0, vdiff_mV+0
+    mov x+1, vdiff_mV+1
+    mov x+2, vdiff_mV+2
+    mov x+3, vdiff_mV+3
+    Load_y(100)
+    lcall mul32
+    Load_y(61)
+    lcall add32
+    Load_y(123)
+    lcall div32               ; x = deltaT10 (positive)
+    mov deltat10+0, x+0
+    mov deltat10+1, x+1
+    mov deltat10+2, x+2
+    mov deltat10+3, x+3
+    ljmp got_delta
+
+vdiff_neg:
+    ; x = abs(Vdiff)
+    mov x+0, vdiff_mV+0
+    mov x+1, vdiff_mV+1
+    mov x+2, vdiff_mV+2
+    mov x+3, vdiff_mV+3
+    ; abs: two's complement
+    mov a, x+0
+    cpl a
+    mov x+0, a
+    mov a, x+1
+    cpl a
+    mov x+1, a
+    mov a, x+2
+    cpl a
+    mov x+2, a
+    mov a, x+3
+    cpl a
+    mov x+3, a
+    Load_y(1)
+    lcall add32
+
+    ; now compute magnitude
+    Load_y(100)
+    lcall mul32
+    Load_y(61)
+    lcall add32
+    Load_y(123)
+    lcall div32               ; x = |deltaT10|
+
+    ; make it negative
+    mov a, x+0
+    cpl a
+    mov x+0, a
+    mov a, x+1
+    cpl a
+    mov x+1, a
+    mov a, x+2
+    cpl a
+    mov x+2, a
+    mov a, x+3
+    cpl a
+    mov x+3, a
+    Load_y(1)
+    lcall add32
+
+    mov deltat10+0, x+0
+    mov deltat10+1, x+1
+    mov deltat10+2, x+2
+    mov deltat10+3, x+3
+
+got_delta:
+    ;====================================================
+    ; Thot10 = Tcold10 + deltaT10
+    ;====================================================
+    mov x+0, deltat10+0
+    mov x+1, deltat10+1
+    mov x+2, deltat10+2
+    mov x+3, deltat10+3
+
+    mov y+0, tcold10+0
+    mov y+1, tcold10+1
+    mov y+2, tcold10+2
+    mov y+3, tcold10+3
+
+    lcall add32               ; x = Thot10 (signed)
+
+    ; store Thot10 copy for FSM comparisons
+    mov thot10+0, x+0
+    mov thot10+1, x+1
+    mov thot10+2, x+2
+    mov thot10+3, x+3
+
+    ; Display signed Thot10
+    lcall Display_SignedTemp1dp
+
+    ;====================================================
+    ; Timebase: 200ms tick; run FSM once per 1 second
+    ;====================================================
+    lcall Delay200ms
+
+    inc tick200
+    mov a, tick200
+    cjne a, #5, loop_again
+    mov tick200, #0
+
+    ; once per second: update FSM (ON/OFF/ABORT/DONE)
+    lcall FSM_1s_Update
+
+loop_again:
+    ljmp main_loop
 
 ref_bad:
-    LCALL ShowErr9999
-    LCALL Delay200ms
-    LJMP main_loop
+    lcall SSR_Off
+    mov state, #3            ; ABORT
+    lcall ShowErr
+    lcall Delay200ms
+    ljmp main_loop
 
-temp_negative:
-    LCALL Show0000
-    LCALL Delay200ms
-    LJMP main_loop
+end
 
-END
