@@ -21,11 +21,11 @@ $MODMAX10
 ;
 ; FSM (simple test):
 ;   state 0 IDLE   -> SSR OFF
-;   state 1 HEAT60 -> SSR ON until Thot10 >= 600 (60.0°C)
+;   state 1 HEAT70 -> SSR ON until Thot10 >= 700 (70.0°C)
 ;   state 2 DONE   -> SSR OFF
 ;   state 3 ABORT  -> SSR OFF
 ;
-; Safety (in HEAT60):
+; Safety (in HEAT70):
 ;   if after 60 seconds Thot10 < 500 (50.0°C) -> ABORT
 ;
 ; NOTE: For your BJT driver (2N3904, 1k base resistor, SSR+ to +5V):
@@ -60,9 +60,9 @@ deltat10:    ds 4        ; 0.1°C (signed)
 thot10:      ds 4        ; 0.1°C (signed) copy of computed Thot10
 
 ; FSM vars
-state:       ds 1        ; 0=IDLE, 1=HEAT_TO_60, 2=DONE, 3=ABORT
+state:       ds 1        ; 0=IDLE, 1=HEAT_TO_70, 2=DONE, 3=ABORT
 tick200:     ds 1        ; 0..4  (5*200ms = 1s)
-sec_in_heat: ds 2        ; seconds in HEAT_TO_60
+sec_in_heat: ds 2        ; seconds in HEAT_TO_70
 
 bseg
 mf:          dbit 1
@@ -258,7 +258,7 @@ ADC2_to_mV:
 ;========================================================
 FSM_1s_Update:
     mov a, state
-    cjne a, #1, fsm_not_heat   ; only act in HEAT_TO_60
+    cjne a, #1, fsm_not_heat   ; only act in HEAT_TO_70
 
     ; sec_in_heat++
     inc sec_in_heat+0
@@ -268,16 +268,16 @@ FSM_1s_Update:
 heat_sec_ok:
 
     ;-----------------------------------------
-    ; If Thot10 >= 600 => DONE (SSR OFF)
+    ; If Thot10 >= 700 => DONE (SSR OFF)
     ;-----------------------------------------
     mov x+0, thot10+0
     mov x+1, thot10+1
     mov x+2, thot10+2
     mov x+3, thot10+3
-    Load_y(600)
-    lcall sub32                ; x = Thot10 - 600
+    Load_y(700)
+    lcall sub32                ; x = Thot10 - 700
     mov a, x+3
-    jnb ACC.7, reached60       ; not negative => >= 600
+    jnb ACC.7, reached70       ; not negative => >= 700
 
     ;-----------------------------------------
     ; Safety: if sec_in_heat >= 60 AND Thot10 < 500 => ABORT
@@ -303,7 +303,7 @@ keep_heating:
     lcall SSR_On
     ret
 
-reached60:
+reached70:
     lcall SSR_Off
     mov state, #2              ; DONE
     ret
@@ -328,7 +328,7 @@ mycode:
     lcall SSR_Off
 
     ; FSM init: start heating immediately
-    mov state, #1              ; HEAT_TO_60
+    mov state, #1              ; HEAT_TO_70
     mov tick200, #0
     mov sec_in_heat+0, #0
     mov sec_in_heat+1, #0
@@ -586,4 +586,3 @@ ref_bad:
     ljmp main_loop
 
 end
-
