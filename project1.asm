@@ -40,6 +40,12 @@ $MODMAX10
 ; SSR Output (DE10-Lite IO15)
 ;----------------------------
 SSR_OUT     equ P4.6
+ELCD_D7     equ P0.1
+ELCD_D6     equ P0.3
+ELCD_D5     equ P0.5
+ELCD_D4     equ P0.7
+ELCD_RS     equ P1.7
+ELCD_E      equ TXD
 
 ;----------------------------
 ; RAM
@@ -70,6 +76,8 @@ mf:          dbit 1
 $include(math32.asm)
 
 cseg
+
+$include(LCD_4bit_DE10Lite_no_RW.inc)
 
 ;========================================================
 ; 7-seg LUT
@@ -191,6 +199,81 @@ ds_abs:
     movc a, @a+dptr
     mov HEX0, a
     ret
+
+;========================================================
+; Display signed XXXX.X on LCD row 1
+;========================================================
+Display_SignedTemp1dp_LCD:
+    mov x+0, thot10+0
+    mov x+1, thot10+1
+    mov x+2, thot10+2
+    mov x+3, thot10+3
+
+    mov a, x+3
+    jb  ACC.7, lcd_neg
+
+lcd_pos:
+    mov r6, #' '
+    ljmp lcd_abs
+
+lcd_neg:
+    mov r6, #'-'
+    mov a, x+0
+    cpl a
+    mov x+0, a
+    mov a, x+1
+    cpl a
+    mov x+1, a
+    mov a, x+2
+    cpl a
+    mov x+2, a
+    mov a, x+3
+    cpl a
+    mov x+3, a
+    Load_y(1)
+    lcall add32
+
+lcd_abs:
+    lcall hex2bcd
+
+    Set_Cursor(1, 1)
+    Send_Constant_String(#lcd_label)
+    mov a, r6
+    lcall ?WriteData
+
+    mov a, bcd+2
+    anl a, #0FH
+    orl a, #30h
+    lcall ?WriteData
+
+    mov a, bcd+1
+    swap a
+    anl a, #0FH
+    orl a, #30h
+    lcall ?WriteData
+
+    mov a, bcd+1
+    anl a, #0FH
+    orl a, #30h
+    lcall ?WriteData
+
+    mov a, bcd+0
+    swap a
+    anl a, #0FH
+    orl a, #30h
+    lcall ?WriteData
+
+    mov a, #'.'
+    lcall ?WriteData
+
+    mov a, bcd+0
+    anl a, #0FH
+    orl a, #30h
+    lcall ?WriteData
+    ret
+
+lcd_label:
+    DB 'T=', 0
 
 ShowErr:
     ; show 9999.9
@@ -326,6 +409,7 @@ mycode:
 
     ; SSR output default OFF
     lcall SSR_Off
+    lcall ELCD_4BIT
 
     ; FSM init: start heating immediately
     mov state, #1              ; HEAT_TO_70
@@ -561,6 +645,7 @@ got_delta:
 
     ; Display signed Thot10
     lcall Display_SignedTemp1dp
+    lcall Display_SignedTemp1dp_LCD
 
     ;====================================================
     ; Timebase: 200ms tick; run FSM once per 1 second
@@ -586,3 +671,4 @@ ref_bad:
     ljmp main_loop
 
 end
+
