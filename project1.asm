@@ -82,21 +82,25 @@ myLUT:
 ;========================================================
 ; Delays
 ;========================================================
+Delay1ms:
+    mov TMOD, #01h
+    mov TH0, #0EFh
+    mov TL0, #0A9h
+    setb TR0
+D1_wait:
+    jnb TF0, D1_wait
+    clr TR0
+    clr TF0
+    ret
+
 DelaySmall:
-    nop
-    nop
-    nop
+    lcall Delay1ms
     ret
 
 Delay50ms:
-    mov R0, #30
+    mov R0, #50
 D50_L0:
-    mov R1, #74
-D50_L1:
-    mov R2, #250
-D50_L2:
-    djnz R2, D50_L2
-    djnz R1, D50_L1
+    lcall Delay1ms
     djnz R0, D50_L0
     ret
 
